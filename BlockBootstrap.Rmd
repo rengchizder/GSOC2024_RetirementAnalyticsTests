@@ -1,0 +1,187 @@
+---
+title: "BlockBootstrap"
+author: "Reng Chiz Der"
+date: "2024-03-05"
+output: html_document
+---
+### Task
+Block Bootstrapping w/ random block size & randomization  
+- A key portion of this project will be constructing Monte Carlo simulations for asset returns  
+as well as interest rates (on cash) and yields (on bonds or other fixed income assets, as well as dividends).  
+- Demonstrate a multi-variable block bootstrap function with randomized block size and random noise parameters for the input time series.  
+- Use xts time series and assume 'wide' data construction.  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Environment Setup
+```{r}
+library(quantmod)
+library(zoo)
+library(xts)
+library(ggplot2)
+library(PerformanceAnalytics)
+```
+
+### Get Real-world Portfolio Data
+```{r}
+# A function to get real world data
+fetch_and_preprocess <- function(tickers) {
+  stocks <- lapply(tickers, function(ticker) {
+    stock_data <- getSymbols(ticker, src = 'yahoo', from = "2020-01-01", to = "2024-01-01", auto.assign = FALSE)
+    colnames(stock_data) <- gsub(".*\\.", "", colnames(stock_data)) # Remove the prefix
+    adjusted_data <- stock_data[, "Adjusted", drop = FALSE] # Select only the adjusted closing value
+    if ("Adjusted" %in% colnames(stock_data)) {
+      colnames(adjusted_data) <- ticker
+      return(adjusted_data)
+    } else {
+      stop("Adjusted closing value not found for", ticker)
+    }
+  })
+  
+  # Preprocess the data
+  for (i in seq_along(stocks)) {
+    if (!is.null(stocks[[i]])) {
+      # Calculate the number of missing values
+      missing_values <- colSums(is.na(stocks[[i]]))
+      
+      # Replace missing values with the previous day's values
+      stocks[[i]] <- na.locf(stocks[[i]])
+    }
+  }
+  
+  # Combine the data into a single xts object
+  combined_data <- do.call(merge, stocks)
+  return(combined_data)
+}
+
+# Stocks
+stocks <- c('AAPL', 'NVDA', 'AMD')
+stock_data <- fetch_and_preprocess(stocks)
+
+# S&P500, Emerging Market ETF
+etfs <- c('SPY', 'SPEM')
+etf_data <- fetch_and_preprocess(etfs)
+
+# fixed income (bonds): IEF (treasury bond ETF), AGG (US Aggregate Bond ETF)
+fis <- c('IEF', 'AGG')
+fi_data <- fetch_and_preprocess(fis)
+
+comms <- c('BCI')
+comm_data <- fetch_and_preprocess(comms)
+
+# SPDR  Gold Share ETF
+gold <- c('GLD')
+gold_data <- fetch_and_preprocess(gold)
+
+# Long volatility
+long_vol <- c('VIXY')
+long_vol_data <- fetch_and_preprocess(long_vol)
+```
+
+### Construct Portfolio and Prepocessing
+```{r}
+# Create a sample portfolio of different assets
+portfolio <- cbind(stock_data, etf_data, fi_data, comm_data, gold_data)
+portfolio_na_counts <- colSums(is.na(portfolio))
+portfolio_na_counts
+plot(portfolio, main = "Adjusted Closing Prices", xlab = "Date", ylab = "Price", col = rainbow(ncol(portfolio)), legend.loc = "topright")
+
+# Convert the data from adjusted closing price to daily return
+portfolio_dr <- Return.calculate(portfolio, method = "simple")
+portfolio_dr <- portfolio_dr * 100
+# Remove first day w/o return
+portfolio_dr <- portfolio_dr[-1, ]
+```
+
+### Block Bootstrap Function
+```{r}
+### block bootstrap w/ random block size + random noise params
+random_size_block_bootstrap <- function(series) {
+  ori_size <- length(series)
+  
+  # Initialize new series
+  new_series <- numeric(0)
+  
+  while (length(new_series) < ori_size) {
+    # Generate random block size restricted to at most half the size of the original series
+    # Would ensure that the blocks towards the end of generated series not smaller
+    block_size <- sample(1:(ori_size %/% 2), size = 1)
+    
+    # Get random index
+    index <- sample(1:ori_size, size = 1)
+    
+    cat("Block size:", block_size, "Index:", index, "\n")
+    
+    # Circular sampling
+    sampled_values <- numeric(block_size)
+    for (j in 1:block_size) {
+      sampled_index <- ((index - 1 + j - 1) %% ori_size) + 1  # Circular index calculation
+      sampled_values[j] <- series[sampled_index]
+    }
+    
+    # Append sampled series
+    new_series <- c(new_series, sampled_values)
+  }
+  
+  # Trim down new series to original series size
+  new_series <- new_series[1:ori_size]
+  
+  # Random noise parameters
+  series_std_dev <- sd(series)
+  
+  # Set noise to be a fraction (e.g. 10%) of the series' s.d.
+  noise_frac <- 0.1
+  noise_sd <- noise_frac * series_std_dev
+  
+  # Random noise with mean = 0 as expected return can be 0, and s.d. be fraction of the s.d. (volatility)
+  new_series <- new_series + rnorm(length(new_series), mean = 0, sd = noise_sd)
+  
+  return(new_series)
+}
+
+# Function to perform block bootstrap independently on each asset
+portfolio_bootstrap <- function(portfolio) {
+  # Get the names of assets
+  col_names <- colnames(portfolio)
+  
+  # Initialize data frame to store bootstrapped data for each column
+  bootstrapped_data <- data.frame(matrix(NA, nrow = nrow(portfolio), ncol = length(col_names)))
+  colnames(bootstrapped_data) <- col_names
+  
+  # Loop through each column
+  for (col in col_names) {
+    # Perform block bootstrap on the column
+    bootstrapped_col <- random_size_block_bootstrap(portfolio[, col])
+    
+    # Store bootstrapped column in the data frame
+    bootstrapped_data[[col]] <- bootstrapped_col
+  }
+  
+  # Convert data frame to xts object
+  bootstrapped_xts <- xts(bootstrapped_data, order.by = index(portfolio))
+  
+  return(bootstrapped_xts)
+}
+```
+
+### Apply Block Bootstrap on Data
+```{r}
+bootstrapped_portfolio_dr = portfolio_bootstrap(portfolio_dr)
+bootstrapped_portfolio_dr
+
+plot(portfolio_dr, main = "Daily Percentage Return", xlab = "Date", ylab = "% Return", col = rainbow(ncol(portfolio_dr)), legend.loc = "topright")
+plot(bootstrapped_portfolio_dr, main = "Daily Percentage Return", xlab = "Date", ylab = "% Return", col = rainbow(ncol(bootstrapped_portfolio_dr)), legend.loc = "topright")
+```
+
+### Assumptions Made
+1. The block bootstrapping is applied to each asset independently.
+2. The randomized block size is random and have a maximum of N/2 where N is the total number of days.
+3. The randomization does not follow distribution, for instance, like Stationary Bootstrap.
+4. The random noise parameters follow a Normal Distribution
+
+### References
+1. [https://asbates.rbind.io/2019/03/30/time-series-bootstrap-methods/]  
+2. [http://sfb649.wiwi.hu-berlin.de/fedc_homepage/xplore/ebooks/html/csa/node132.html#SECTION019142000000000000000]  
+3. [https://medium.com/@jcatankard_76170/block-bootstrapping-with-time-series-and-spatial-data-bd7d7830681e]  
+4. [https://stat.ethz.ch/R-manual/R-devel/library/boot/html/tsboot.html]  
